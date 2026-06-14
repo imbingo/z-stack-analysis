@@ -2525,17 +2525,8 @@ class ZStackFocusAnalyzer(tk.Tk):
             if grid_px < 1:
                 raise ValueError
         except Exception:
-            messagebox.showwarning("网格尺寸无效", "请填写 >= 1 的网格尺寸，单位 pixel。填 1 表示逐像素（最慢但最细），快速预览建议 32 或 64。")
+            messagebox.showwarning("网格尺寸无效", "请填写 >= 1 的网格尺寸，单位 pixel。填 1 表示逐像素（最细），快速预览建议 32 或 64。")
             return
-        if grid_px == 1:
-            big = (self.roi is None) or (not self.topo_use_roi_var.get())
-            if not messagebox.askokcancel(
-                "逐像素模式确认",
-                "grid=1 表示逐像素高斯/亮度拟合，不做任何网格平均，"
-                + ("当前是整幅 FOV，" if big else "")
-                + "计算量很大、耗时可能较长。\n\n建议先框选并勾选 ROI 缩小范围。是否继续？",
-            ):
-                return
 
         try:
             sigma_filter = float(self.topo_sigma_filter_var.get())
