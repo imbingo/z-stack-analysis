@@ -49,6 +49,11 @@ rcParams["axes.unicode_minus"] = False
 
 SUPPORTED_EXT = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
+# 高度图信号门限：每个像素的 Z 向曲线变化幅度需达到“全局动态范围”的这个比例，
+# 才认为该像素含有效信号、参与拟合；否则视为背景/弱信号直接跳过（不拟合、不计入面型）。
+# 共聚焦黑背景下背景近乎为 0，取 8% 可稳妥排除背景，又不误杀真实低对比特征。
+TOPO_SIGNAL_REL = 0.08
+
 
 def natural_key(s: str):
     return [int(text) if text.isdigit() else text.lower() for text in re.split(r"(\d+)", s)]
@@ -758,6 +763,114 @@ def _score_image_for_topography(raw_crop: np.ndarray, mode: str) -> np.ndarray:
     return focus_energy.astype(np.float32)
 
 
+def _fit_height_maps_vectorized(
+    curves: np.ndarray,
+    z_values: np.ndarray,
+    signal_mask: np.ndarray,
+    use_log: bool,
+    polarity: str,
+    want_fused: bool,
+) -> Dict[str, np.ndarray]:
+    """全向量化逐像素亚层峰/谷定位，取代逐像素 scipy curve_fit。
+
+    对每个像素的 Z 向曲线，在峰值层附近取 3 点做二次（抛物线）顶点插值：
+    - use_log=True 时拟合 ln(曲线-基线)，等价于高斯峰，可同时得到 σ；这与代码里
+      已有的 “log-Gaussian” 退化算法同源，但一次性对整幅网格向量化，速度快几个数量级。
+    - use_log=False 时直接抛物线峰，仅定位亚层 Z（无 σ）。
+    polarity='valley' 时对 -曲线 求峰。want_fused 仅在亮度峰值下有意义，输出高斯加权
+    融合灰度(EDF)与峰值灰度。signal_mask=False 的像素全部置 NaN（背景/弱信号不拟合）。
+    返回 dict：height/sigma/r2/fused_peak/fused_weighted/confidence，形状均为 (ny, nx)。
+    """
+    Zn, ny, nx = curves.shape
+    order = np.argsort(np.asarray(z_values, dtype=np.float64))
+    z = np.asarray(z_values, dtype=np.float64)[order]
+    C = np.asarray(curves, dtype=np.float64)[order]            # (Z, ny, nx) 按 z 升序
+    dz = float(np.median(np.diff(z))) if Zn > 1 else 1.0
+    if not np.isfinite(dz) or dz <= 0:
+        dz = 1.0
+
+    def nanmap():
+        return np.full((ny, nx), np.nan, dtype=np.float64)
+
+    def take(a3, idx2):
+        return np.take_along_axis(a3, idx2[None, :, :], axis=0)[0]
+
+    S = C if polarity == "peak" else -C                        # 统一成找“峰”
+    base = np.nanpercentile(S, 10, axis=0)                      # 稳健基线 (ny, nx)
+    pos = np.maximum(S - base[None, :, :], 1e-12)
+    yv = np.log(pos) if use_log else pos                        # 抛物线拟合对象
+
+    pk = np.argmax(S, axis=0)                                   # 峰层索引 (ny, nx)
+    pkm = np.clip(pk - 1, 0, Zn - 1)
+    pkp = np.clip(pk + 1, 0, Zn - 1)
+    ym = take(yv, pkm); y0 = take(yv, pk); yp = take(yv, pkp)
+    z0 = z[pk]
+
+    denom = ym - 2.0 * y0 + yp
+    interior = (pk > 0) & (pk < Zn - 1)
+    concave = denom < -1e-12
+    good = interior & concave & signal_mask
+
+    delta = np.zeros((ny, nx), dtype=np.float64)
+    np.divide(0.5 * (ym - yp), denom, out=delta, where=good)
+    delta = np.clip(delta, -1.0, 1.0)
+    mu = np.where(good, z0 + delta * dz, z0)
+    vertex = y0 + 0.5 * (yp - ym) * delta + 0.5 * denom * delta * delta   # 顶点处 yv 值
+
+    sigma_m = nanmap()
+    if use_log:
+        with np.errstate(invalid="ignore", divide="ignore"):
+            sig = dz / np.sqrt(-denom)
+        sigma_m = np.where(good & np.isfinite(sig) & (sig > 0), sig, np.nan)
+
+    height = np.where(signal_mask, mu, np.nan)
+    peak_gray = take(C, pk)                                     # 峰层灰度（C 域）
+
+    fused_peak = nanmap()
+    fused_weighted = nanmap()
+    if want_fused:
+        amp = np.exp(vertex) if use_log else vertex            # 峰值高出基线的量
+        peak_val = base + amp                                  # 顶点处 S(=C) 值
+        fused_peak = np.where(signal_mask, np.where(good, peak_val, peak_gray), np.nan)
+        if use_log:
+            # 高斯加权融合(EDF)：以各像素 μ/σ 为权重沿 Z 加权平均原始灰度。
+            sig_w = np.where(np.isfinite(sigma_m) & (sigma_m > 1e-9), sigma_m, dz)
+            zc = z[:, None, None]
+            w = np.exp(-((zc - mu[None, :, :]) ** 2) / (2.0 * sig_w[None, :, :] ** 2))
+            sw = np.sum(w, axis=0)
+            fw = np.sum(w * C, axis=0) / np.where(sw > 1e-12, sw, np.nan)
+            fw = np.where(np.isfinite(fw), fw, peak_gray)
+            fused_weighted = np.where(signal_mask, fw, np.nan)
+        else:
+            # 非高斯（抛物线/峰值）模式：融合灰度退化为峰层灰度。
+            fused_weighted = np.where(signal_mask, peak_gray, np.nan)
+
+    r2_m = nanmap()
+    conf = nanmap()
+    if use_log:
+        amp_eff = np.where(good, np.exp(vertex), np.nan)
+        sig_eff = np.where(np.isfinite(sigma_m) & (sigma_m > 1e-9), sigma_m, np.nan)
+        zc = z[:, None, None]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            fitted = base[None, :, :] + amp_eff[None, :, :] * np.exp(
+                -((zc - mu[None, :, :]) ** 2) / (2.0 * sig_eff[None, :, :] ** 2)
+            )
+            ss_res = np.sum((S - fitted) ** 2, axis=0)
+            mean_s = np.mean(S, axis=0)
+            ss_tot = np.sum((S - mean_s[None, :, :]) ** 2, axis=0)
+            r2 = 1.0 - ss_res / np.where(ss_tot > 1e-12, ss_tot, np.nan)
+        r2_m = np.where(good, r2, np.nan)
+        conf = np.clip(np.where(np.isfinite(r2_m), r2_m, 0.0), 0.0, 1.0)
+        conf = np.where(signal_mask, conf, np.nan)
+    else:
+        conf = np.where(signal_mask & np.isfinite(height), 0.6, np.nan)
+
+    return {
+        "height": height, "sigma": sigma_m, "r2": r2_m,
+        "fused_peak": fused_peak, "fused_weighted": fused_weighted, "confidence": conf,
+    }
+
+
 def build_height_map_from_zstack(
     image_paths: List[str],
     z_values: np.ndarray,
@@ -821,9 +934,14 @@ def build_height_map_from_zstack(
     if "高斯" in mode:
         use_gaussian = True
 
-    # 曲线变化太小的点不参与拟合，防止背景区输出假高度。
+    # 信号门限：每像素 Z 向曲线幅度需达到全局动态范围的 TOPO_SIGNAL_REL，
+    # 否则视为背景/弱信号，直接跳过（不拟合、不计入面型），既加速又避免背景假高度。
     global_range = float(np.nanpercentile(curves, 99) - np.nanpercentile(curves, 1))
-    min_range = max(global_range * 0.005, 1e-9)
+    signal_gate = max(global_range * TOPO_SIGNAL_REL, 1e-9)
+    finite_curve = np.all(np.isfinite(curves), axis=0)
+    curve_range = np.nanmax(curves, axis=0) - np.nanmin(curves, axis=0)
+    signal_mask = finite_curve & (curve_range >= signal_gate)
+
     fit_method_map = np.full((ny, nx), "", dtype=object)
     fit_r2_map = np.full((ny, nx), np.nan, dtype=np.float64)
     fused_peak_map = np.full((ny, nx), np.nan, dtype=np.float64)
@@ -831,99 +949,39 @@ def build_height_map_from_zstack(
     confidence_map = np.full((ny, nx), np.nan, dtype=np.float64)
 
     total_points = int(nx * ny)
-    done_points = 0
     source = "intensity" if (mode.startswith("共聚焦亮度") or mode.startswith("快速")) else "clarity"
-
-    # v2.6 快速路径：类似 Zeiss 最大亮度投影，核心是 numpy 向量化 max/argmax。
-    # 这类算法主要用于快速观察/快速高度趋势，不做非线性高斯优化，因此会比逐点高斯快很多。
+    want_fused = (source == "intensity" and polarity == "peak")
     fast_mode = mode.startswith("快速")
-    if fast_mode:
-        finite_curve = np.all(np.isfinite(curves), axis=0)
-        curve_range = np.nanmax(curves, axis=0) - np.nanmin(curves, axis=0)
-        valid_fast = finite_curve & (curve_range >= min_range)
 
-        if "最大亮度投影" in mode or "峰值Z" in mode:
-            idx_map = np.nanargmax(curves, axis=0)
-            # np.take_along_axis 取每个网格点峰值灰度。
-            peak_vals = np.take_along_axis(curves, idx_map[None, :, :], axis=0)[0].astype(np.float64)
-            height[:, :] = z_values[idx_map]
-            fused_peak_map[:, :] = peak_vals
-            fused_weighted_map[:, :] = peak_vals
-            confidence_map[:, :] = np.where(valid_fast, 0.65, np.nan)
-            fit_method_map[:, :] = "fast_argmax"
-            fit_r2_map[:, :] = np.nan
-
-            if "抛物线" in mode:
-                # 峰值附近 3 点二次插值，得到亚层 Z。仍比 scipy 高斯拟合快很多。
-                for yy in range(ny):
-                    for xx in range(nx):
-                        done_points += 1
-                        if valid_fast[yy, xx]:
-                            c = curves[:, yy, xx].astype(np.float64)
-                            height[yy, xx] = _parabolic_extremum_z(z_values, c, polarity="peak")
-                            fit_method_map[yy, xx] = "fast_parabolic_peak"
-                            confidence_map[yy, xx] = 0.75
-                        if progress_callback and (done_points % max(1, total_points // 40) == 0 or done_points == total_points):
-                            progress_callback(len(image_paths), len(image_paths), done_points, total_points)
-            else:
-                done_points = total_points
-                if progress_callback:
-                    progress_callback(len(image_paths), len(image_paths), done_points, total_points)
-
-        height[~valid_fast] = np.nan
-        fused_peak_map[~valid_fast] = np.nan
-        fused_weighted_map[~valid_fast] = np.nan
-        confidence_map[~valid_fast] = np.nan
+    # 全部模式都走向量化路径：背景/弱信号像素直接被 signal_mask 跳过，逐像素也只需毫秒级。
+    if fast_mode and "抛物线" not in mode:
+        # 快速最大亮度投影 / 峰值Z：纯 argmax，最快，不做亚层插值。
+        idx_map = np.argmax(curves, axis=0)
+        peak_vals = np.take_along_axis(curves, idx_map[None, :, :], axis=0)[0].astype(np.float64)
+        height = np.where(signal_mask, z_values[idx_map], np.nan)
+        fused_peak_map = np.where(signal_mask, peak_vals, np.nan)
+        fused_weighted_map = np.where(signal_mask, peak_vals, np.nan)
+        confidence_map = np.where(signal_mask, 0.65, np.nan)
+        fit_method_map[signal_mask] = "fast_argmax"
     else:
-        for yy in range(ny):
-            for xx in range(nx):
-                done_points += 1
-                c = curves[:, yy, xx].astype(np.float64)
-                try:
-                    if np.all(np.isfinite(c)) and float(np.max(c) - np.min(c)) >= min_range:
-                        if use_gaussian:
-                            if source == "intensity" and polarity == "peak":
-                                fit = estimate_gaussian_focus(z_values, c)
-                                mu = float(fit.get("mu", float("nan")))
-                                sigma = float(fit.get("sigma", float("nan")))
-                                baseline = float(fit.get("baseline", float("nan")))
-                                amp = float(fit.get("amplitude", float("nan")))
-                                r2 = float(fit.get("r2", float("nan")))
-                                method = str(fit.get("method", "gaussian"))
-                                if np.isfinite(mu):
-                                    height[yy, xx] = mu
-                                    fit_method_map[yy, xx] = method
-                                    fit_r2_map[yy, xx] = r2
-                                    if np.isfinite(baseline) and np.isfinite(amp):
-                                        fused_peak_map[yy, xx] = baseline + amp
-                                    if np.isfinite(sigma) and sigma > 1e-9:
-                                        sigma_w = max(sigma, float(np.median(np.diff(np.sort(z_values)))) if len(z_values) > 1 else sigma)
-                                        weights = np.exp(-((z_values - mu) ** 2) / (2.0 * sigma_w ** 2))
-                                        sw = float(np.sum(weights))
-                                        if sw > 1e-12:
-                                            fused_weighted_map[yy, xx] = float(np.sum(weights * c) / sw)
-                                    else:
-                                        fused_weighted_map[yy, xx] = c[int(np.nanargmax(c))]
-                                    confidence_map[yy, xx] = max(0.0, min(1.0, r2 if np.isfinite(r2) else 0.0))
-                            else:
-                                mu, method, r2 = _true_gaussian_focus_z(z_values, c, polarity=polarity, source=source)
-                                if np.isfinite(mu):
-                                    height[yy, xx] = mu
-                                    fit_method_map[yy, xx] = method
-                                    fit_r2_map[yy, xx] = r2
-                                    confidence_map[yy, xx] = max(0.0, min(1.0, r2 if np.isfinite(r2) else 0.0))
-                        else:
-                            height[yy, xx] = _parabolic_extremum_z(z_values, c, polarity=polarity)
-                            fit_method_map[yy, xx] = "parabolic_extremum"
-                            # 非高斯算法下，融合灰度退化为极值层网格灰度。
-                            if source == "intensity":
-                                idx_ext = int(np.nanargmax(c) if polarity == "peak" else np.nanargmin(c))
-                                fused_peak_map[yy, xx] = float(c[idx_ext])
-                                fused_weighted_map[yy, xx] = float(c[idx_ext])
-                                confidence_map[yy, xx] = 0.5
-                finally:
-                    if progress_callback and (done_points % max(1, total_points // 50) == 0 or done_points == total_points):
-                        progress_callback(len(image_paths), len(image_paths), done_points, total_points)
+        # 快速+抛物线 / 逐点高斯 / 逐点抛物线：全向量化亚层定位（含逐像素 grid=1）。
+        out = _fit_height_maps_vectorized(
+            curves, z_values, signal_mask,
+            use_log=use_gaussian, polarity=polarity, want_fused=want_fused,
+        )
+        height = out["height"]
+        fit_r2_map = out["r2"]
+        confidence_map = out["confidence"]
+        fused_peak_map = out["fused_peak"]
+        fused_weighted_map = out["fused_weighted"]
+        if fast_mode:
+            confidence_map = np.where(signal_mask, 0.75, np.nan)
+            fit_method_map[signal_mask] = "fast_parabolic_peak"
+        else:
+            fit_method_map[signal_mask] = "vectorized_log_gaussian" if use_gaussian else "vectorized_parabolic"
+
+    if progress_callback:
+        progress_callback(len(image_paths), len(image_paths), total_points, total_points)
 
     # 网格中心坐标。坐标使用原图像素坐标乘 pixel size；平面斜率与 ROI 偏移无关。
     x_edges = np.linspace(x0, x0 + rw, nx + 1)
