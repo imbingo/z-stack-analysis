@@ -15,7 +15,7 @@ Z-stack Focus Analyzer v2.6 Fast projection + precision Gaussian fusion
 9. 对高度图拟合平面，计算 Rx/Ry、去倾斜面型 PV/RMS 和原始 TTV
 10. 支持高度图 ROI 内添加多个排除区域 Mask，排除点不参与平面拟合/PV/RMS/TTV
 11. 高度图平面拟合支持 nσ 残差迭代滤波；Rx/Ry 按左手坐标系 X右/Y里/Z下修正符号
-11. 输出最佳焦面层、曲线、相邻层对比图、CSV 结果
+12. 输出最佳焦面层、曲线、相邻层对比图、CSV 结果
 
 依赖：opencv-python, pillow, numpy, pandas, matplotlib
 运行：python zstack_focus_analyzer.py
@@ -776,8 +776,8 @@ def build_height_map_from_zstack(
     """
     if not image_paths:
         raise ValueError("未选择 Z-stack 图片。")
-    if grid_px <= 1:
-        raise ValueError("网格尺寸 grid_px 必须大于 1。")
+    if grid_px < 1:
+        raise ValueError("网格尺寸 grid_px 必须 >= 1（填 1 表示逐像素，不做网格平均）。")
     if pixel_size_um <= 0:
         raise ValueError("Pixel size 必须大于 0。")
     try:
@@ -1082,8 +1082,8 @@ class LayerResult:
     filename: str
     path: str
     metrics: Dict[str, float]
-    score: float = 0.0
-    z_um: float = 0.0
+    # 当前算法下的归一化评分（焦面判定用）。Z 绝对值由 ZStackFocusAnalyzer.z_value(index) 现算。
+    combined_score: float = 0.0
 
 
 class ZStackFocusAnalyzer(tk.Tk):
@@ -1380,7 +1380,7 @@ class ZStackFocusAnalyzer(tk.Tk):
         ttk.Label(line3, text="  0=关闭").pack(side=tk.LEFT)
         ttk.Label(
             topo_param_frame,
-            text="建议先用 32 或 64 px；残差滤波建议 3σ，异常点多可用 2.5σ，想看原始结果填 0 关闭。",
+            text="网格 px：填 1=逐像素(最细最慢)，快速预览建议 32 或 64；残差滤波建议 3σ，异常点多用 2.5σ，填 0 关闭。",
             wraplength=360,
         ).pack(anchor="w", padx=6, pady=(0, 6))
 
@@ -1914,11 +1914,16 @@ class ZStackFocusAnalyzer(tk.Tk):
                 disp = normalize_to_255(raw)
                 disp = resize_max_dim(disp, 1200)
                 self._display_cache[i] = disp
-                # 缓存限制，避免大量大图占内存；原图尺寸缓存同步淘汰。
-                if len(self._display_cache) > 8:
-                    for k in list(self._display_cache.keys())[:-8]:
-                        self._display_cache.pop(k, None)
-                        self._orig_size_cache.pop(k, None)
+                # LRU 淘汰：超出上限时丢弃最久未访问的层，原图尺寸缓存同步淘汰。
+                while len(self._display_cache) > 8:
+                    old_k = next(iter(self._display_cache))
+                    self._display_cache.pop(old_k, None)
+                    self._orig_size_cache.pop(old_k, None)
+            else:
+                # 命中即视为最近使用，移到末尾，保持 LRU 顺序。
+                self._display_cache[i] = self._display_cache.pop(i)
+                if i in self._orig_size_cache:
+                    self._orig_size_cache[i] = self._orig_size_cache.pop(i)
             img = self._display_cache[i]
             ax.imshow(img, cmap="gray")
             ax.set_title(title, fontsize=10)
@@ -2459,11 +2464,20 @@ class ZStackFocusAnalyzer(tk.Tk):
             return
         try:
             grid_px = int(self.topo_grid_px.get())
-            if grid_px <= 1:
+            if grid_px < 1:
                 raise ValueError
         except Exception:
-            messagebox.showwarning("网格尺寸无效", "请填写大于 1 的网格尺寸，单位 pixel。建议先用 32 或 64。")
+            messagebox.showwarning("网格尺寸无效", "请填写 >= 1 的网格尺寸，单位 pixel。填 1 表示逐像素（最慢但最细），快速预览建议 32 或 64。")
             return
+        if grid_px == 1:
+            big = (self.roi is None) or (not self.topo_use_roi_var.get())
+            if not messagebox.askokcancel(
+                "逐像素模式确认",
+                "grid=1 表示逐像素高斯/亮度拟合，不做任何网格平均，"
+                + ("当前是整幅 FOV，" if big else "")
+                + "计算量很大、耗时可能较长。\n\n建议先框选并勾选 ROI 缩小范围。是否继续？",
+            ):
+                return
 
         try:
             sigma_filter = float(self.topo_sigma_filter_var.get())
