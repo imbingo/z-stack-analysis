@@ -42,6 +42,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.figure import Figure
 from matplotlib.widgets import RectangleSelector
 from matplotlib import rcParams
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  注册 3D 投影
 
 # 解决 Windows 上 Matplotlib 中文标题/坐标轴乱码问题。
 rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "Noto Sans CJK SC", "Arial Unicode MS", "DejaVu Sans"]
@@ -1030,27 +1031,31 @@ def build_height_map_from_zstack(
         coeff_local, *_ = np.linalg.lstsq(A_local, z_local, rcond=None)
         return [float(v) for v in coeff_local]
 
-    # nσ 残差迭代滤波：先拟合平面，再按残差标准差剔除异常高度点，重新拟合。
-    # sigma_filter <= 0 时关闭滤波。滤波后的 inlier_mask 同时用于平面、PV/RMS/TTV 统计。
+    # nσ 残差迭代滤波：先拟合平面，再按残差剔除异常高度点，重新拟合。
+    # 用 MAD（中位数绝对偏差）估计残差 σ 并以中位数为中心做阈值，对少量极端离群噪声更稳健，
+    # 避免离群点抬高 σ 导致漏剔；滤波后的 inlier_mask 同时用于平面、Rx/Ry、PV/RMS/TTV 统计。
+    # sigma_filter <= 0 时关闭滤波。
     inlier_mask = base_mask.copy()
     sigma_iterations = 0
     residual_sigma_um = float("nan")
     residual_threshold_um = float("nan")
     if sigma_filter > 0:
-        for _ in range(6):
+        for _ in range(8):
             if int(np.count_nonzero(inlier_mask)) < 3:
                 break
             a_tmp, b_tmp, c_tmp = _fit_plane(inlier_mask)
             plane_tmp = a_tmp * xx_um + b_tmp * yy_um + c_tmp
             resid_tmp = height - plane_tmp
             rv = resid_tmp[inlier_mask]
-            sigma_um = float(np.nanstd(rv))
+            med = float(np.nanmedian(rv))
+            mad = float(np.nanmedian(np.abs(rv - med)))
+            sigma_um = 1.4826 * mad if mad > 1e-12 else float(np.nanstd(rv))
             residual_sigma_um = sigma_um
             if (not np.isfinite(sigma_um)) or sigma_um <= 1e-12:
                 break
             threshold_um = float(sigma_filter * sigma_um)
             residual_threshold_um = threshold_um
-            new_inlier_mask = base_mask & (np.abs(resid_tmp) <= threshold_um)
+            new_inlier_mask = base_mask & (np.abs(resid_tmp - med) <= threshold_um)
             if int(np.count_nonzero(new_inlier_mask)) < 3:
                 break
             sigma_iterations += 1
@@ -1111,8 +1116,25 @@ def build_height_map_from_zstack(
         "exclude_rois": normalized_exclude_rois,
     }
 
+    # 背景/被剔除像素用“最近的真实测量高度”补全（最近邻），得到无空洞的高度图，
+    # 仅用于显示与 3D 曲面；Rx/Ry、PV/RMS/TTV 等统计仍只用真实 inlier 点，不受补全影响。
+    height_filled = height.copy()
+    try:
+        from scipy.interpolate import griddata
+        yy_idx, xx_idx = np.mgrid[0:ny, 0:nx]
+        src = inlier_mask & np.isfinite(height)
+        if int(np.count_nonzero(src)) >= 4:
+            pts = np.column_stack([xx_idx[src].ravel(), yy_idx[src].ravel()])
+            vals = height[src].ravel()
+            nn = griddata(pts, vals, (xx_idx, yy_idx), method="nearest")
+            need = ~np.isfinite(height_filled)
+            height_filled[need] = nn[need]
+    except Exception:
+        height_filled = height.copy()
+
     return {
         "height_map": height,
+        "height_filled_map": height_filled,
         "plane_map": plane,
         "residual_map": residual,
         "x_um": x_um,
@@ -1572,13 +1594,13 @@ class ZStackFocusAnalyzer(tk.Tk):
         self.plot_mode = "standard"
 
     def _make_topography_axes(self):
-        """高度图页面使用：高斯融合灰度图、高度图、残差图、拟合质量图。"""
+        """高度图页面使用：高斯融合灰度图、高度图、残差图、3D 高度图。"""
         self._detach_selector()
         self.fig.clear()
         self.ax_img = self.fig.add_subplot(2, 2, 1)
         self.ax_curve = self.fig.add_subplot(2, 2, 2)
         self.ax_prev = self.fig.add_subplot(2, 2, 3)
-        self.ax_next = self.fig.add_subplot(2, 2, 4)
+        self.ax_next = self.fig.add_subplot(2, 2, 4, projection="3d")
         self.plot_mode = "topography"
 
     def _make_mark_drift_axes(self):
@@ -1606,6 +1628,8 @@ class ZStackFocusAnalyzer(tk.Tk):
         ax = event.inaxes
         if ax is None or event.xdata is None or event.ydata is None:
             return
+        if hasattr(ax, "get_zlim"):
+            return  # 3D 子图交给 matplotlib 默认滚轮处理（拖拽旋转、滚轮缩放）
         base = 1.2
         scale = 1.0 / base if event.button == "up" else base
         x0, x1 = ax.get_xlim()
@@ -2646,7 +2670,7 @@ class ZStackFocusAnalyzer(tk.Tk):
         if np.isfinite(float(stats.get('confidence_mean', np.nan))):
             text.append(f"融合/高度图平均置信度：{stats.get('confidence_mean'):.4f}")
         if stats.get('fused_gray_available'):
-            text.append("已生成：融合灰度图 / 高度图 / 残差图 / 质量图")
+            text.append("已生成：融合灰度图 / 高度图 / 残差图 / 3D高度图")
         text.append(f"Pixel size：{stats['pixel_size_um']:.6f} μm/pixel")
         text.append(f"网格尺寸：{stats['grid_px']} px")
         if roi:
@@ -2696,9 +2720,9 @@ class ZStackFocusAnalyzer(tk.Tk):
             return
         self._make_topography_axes()
         height = np.asarray(self.topo_result["height_map"], dtype=float)
+        height_filled = np.asarray(self.topo_result.get("height_filled_map", height), dtype=float)
         residual = np.asarray(self.topo_result["residual_map"], dtype=float)
         fused_weighted = np.asarray(self.topo_result.get("fused_weighted_map", np.full_like(height, np.nan)), dtype=float)
-        confidence = np.asarray(self.topo_result.get("confidence_map", np.full_like(height, np.nan)), dtype=float)
         x_um = np.asarray(self.topo_result["x_um"], dtype=float)
         y_um = np.asarray(self.topo_result["y_um"], dtype=float)
         stats = self.topo_result["stats"]
@@ -2736,13 +2760,14 @@ class ZStackFocusAnalyzer(tk.Tk):
                 ex_rect = plt_rectangle(ex_x * sx, ex_y * sy, ex_w * sx, ex_h * sy, edgecolor="#EF4444", linestyle="--")
                 self.ax_img.add_patch(ex_rect)
 
-        im1 = self.ax_curve.imshow(height, cmap="viridis", origin="upper", aspect="equal")
+        # 右上：FOV 高度图。背景/被剔除点已用最近邻真实高度补全，不再留白。
+        im1 = self.ax_curve.imshow(height_filled, cmap="viridis", origin="upper", aspect="equal")
         sigma_out = np.asarray(self.topo_result.get("sigma_outlier_mask", np.zeros_like(height, dtype=bool)))
         if sigma_out.shape == height.shape and np.any(sigma_out):
             oy, ox = np.where(sigma_out)
-            self.ax_curve.scatter(ox, oy, marker="x", s=18, label="sigma outlier")
+            self.ax_curve.scatter(ox, oy, marker="x", s=18, c="red", label="离群剔除")
             self.ax_curve.legend(loc="upper right", fontsize=7)
-        self.ax_curve.set_title("FOV 高度图 Z / μm", fontsize=10)
+        self.ax_curve.set_title("FOV 高度图 Z / μm（背景已补全）", fontsize=10)
         self.ax_curve.set_xlabel("X grid")
         self.ax_curve.set_ylabel("Y grid")
         self.fig.colorbar(im1, ax=self.ax_curve, fraction=0.046, pad=0.04)
@@ -2753,17 +2778,33 @@ class ZStackFocusAnalyzer(tk.Tk):
         self.ax_prev.set_ylabel("Y grid")
         self.fig.colorbar(im2, ax=self.ax_prev, fraction=0.046, pad=0.04)
 
-        # 右下：拟合质量/置信度图；比 3D surface 更便于判断哪些区域融合图和高度图可信。
-        if np.any(np.isfinite(confidence)):
-            im3 = self.ax_next.imshow(confidence, cmap="magma", origin="upper", aspect="equal", vmin=0, vmax=1)
-            self.ax_next.set_title("高斯拟合质量 / 置信度", fontsize=10)
-            self.ax_next.set_xlabel("X grid")
-            self.ax_next.set_ylabel("Y grid")
-            self.fig.colorbar(im3, ax=self.ax_next, fraction=0.046, pad=0.04)
+        # 右下：FOV 高度 3D 曲面（左手系 X右/Y里/Z下）。背景已按实际值补全，叠加基准拟合平面，
+        # 便于直观看到感兴趣区域相对基准零平面的倾角；可用鼠标拖拽旋转、滚轮缩放。
+        ax3d = self.ax_next
+        H = height_filled
+        if np.any(np.isfinite(H)):
+            ny0, nx0 = H.shape
+            step = max(1, int(math.ceil(max(ny0, nx0) / 110.0)))   # 下采样保证 3D 流畅
+            Hd = H[::step, ::step]
+            Xg, Yg = np.meshgrid(x_um[::step], y_um[::step])
+            try:
+                surf = ax3d.plot_surface(Xg, Yg, Hd, cmap="viridis", linewidth=0, antialiased=True)
+                a = float(stats.get("slope_x_dzdx", 0.0)); b = float(stats.get("slope_y_dzdy", 0.0)); c = float(stats.get("plane_c_um", 0.0))
+                ax3d.plot_surface(Xg, Yg, a * Xg + b * Yg + c, color="gray", alpha=0.25, linewidth=0)  # 基准拟合平面
+                self.fig.colorbar(surf, ax=ax3d, fraction=0.04, pad=0.10)
+            except Exception:
+                pass
+            ax3d.set_title("FOV 高度 3D（左手系 X右/Y里/Z下，灰面=基准平面）", fontsize=9)
+            ax3d.set_xlabel("X / μm")
+            ax3d.set_ylabel("Y / μm")
+            ax3d.set_zlabel("Z / μm")
+            try:
+                ax3d.invert_zaxis()      # Z 向下为正
+                ax3d.view_init(elev=22, azim=-60)
+            except Exception:
+                pass
         else:
-            self.ax_next.text(0.5, 0.5, "当前算法未生成拟合质量图", ha="center", va="center", transform=self.ax_next.transAxes)
-            self.ax_next.set_title("拟合质量 / 置信度", fontsize=10)
-            self.ax_next.axis("off")
+            ax3d.set_title("FOV 高度 3D", fontsize=9)
         self.canvas.draw_idle()
 
     def export_fused_gray_png(self):
