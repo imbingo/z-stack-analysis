@@ -872,6 +872,42 @@ def _fit_height_maps_vectorized(
     }
 
 
+def _spatial_spike_mask(height: np.ndarray, valid_mask: np.ndarray, k_sigma: float, max_cluster: int) -> np.ndarray:
+    """识别“孤立噪声尖刺”：相对局部中值显著偏离、且连通域很小的点。
+
+    孤立坏点(噪声)是小连通域；mark/孔等真实特征是大连通域，不会被当成尖刺。
+    返回需要剔除的尖刺布尔掩码。k_sigma<=0 或 max_cluster<=0 时不剔除。
+    """
+    finite = valid_mask & np.isfinite(height)
+    if k_sigma <= 0 or max_cluster <= 0 or int(np.count_nonzero(finite)) < 9:
+        return np.zeros_like(finite, dtype=bool)
+    try:
+        from scipy.ndimage import median_filter, label
+    except Exception:
+        return np.zeros_like(finite, dtype=bool)
+    fillv = float(np.nanmedian(height[finite]))
+    hf = np.where(finite, height, fillv).astype(np.float64)
+    med = median_filter(hf, size=3, mode="nearest")
+    dev = np.abs(height - med)
+    dv = dev[finite]
+    mdev = float(np.nanmedian(dv))
+    robust = 1.4826 * mdev if mdev > 1e-12 else float(np.nanstd(dv))
+    if not np.isfinite(robust) or robust <= 1e-12:
+        return np.zeros_like(finite, dtype=bool)
+    outlier = finite & (dev > k_sigma * robust)
+    if not np.any(outlier):
+        return np.zeros_like(finite, dtype=bool)
+    lbl, n = label(outlier)
+    if n <= 0:
+        return np.zeros_like(finite, dtype=bool)
+    sizes = np.bincount(lbl.ravel())
+    spike = np.zeros_like(outlier, dtype=bool)
+    for comp in range(1, n + 1):
+        if sizes[comp] <= max_cluster:        # 只剔除小连通域(孤立尖刺)，大连通域(特征)保留
+            spike |= (lbl == comp)
+    return spike
+
+
 def build_height_map_from_zstack(
     image_paths: List[str],
     z_values: np.ndarray,
@@ -881,6 +917,9 @@ def build_height_map_from_zstack(
     mode: str,
     exclude_rois: Optional[List[Tuple[int, int, int, int]]] = None,
     sigma_filter: float = 3.0,
+    r2_min: float = 0.0,
+    spike_sigma: float = 0.0,
+    spike_max_cluster: int = 6,
     progress_callback=None,
 ) -> Dict[str, object]:
     """从 Z-stack 反推网格高度图。
@@ -1022,10 +1061,29 @@ def build_height_map_from_zstack(
         fused_weighted_map[excluded_grid_mask] = np.nan
         confidence_map[excluded_grid_mask] = np.nan
 
+    # ===== 高度噪声滤波（剔除不可信/孤立噪声，但保留 mark 等真实特征）=====
+    # 1) R² 质量门限：高斯拟合 R² 过低的点视为不可信测量（弱信号/饱和/多峰），剔除。
+    #    （快速/抛物线模式无 R²，此项自动跳过。）
+    raw_valid = np.isfinite(height) & (~excluded_grid_mask)
+    r2_reject_mask = np.zeros_like(raw_valid, dtype=bool)
+    if r2_min > 0:
+        r2_reject_mask = raw_valid & np.isfinite(fit_r2_map) & (fit_r2_map < float(r2_min))
+    # 2) 空间孤立尖刺：相对局部中值显著偏离且连通域很小的点（孤立噪声），剔除；大连通域(mark)保留。
+    spike_mask = _spatial_spike_mask(height, raw_valid & (~r2_reject_mask), float(spike_sigma), int(spike_max_cluster))
+
+    # 被滤掉的点（不可信+尖刺）从测量高度里清除（置 NaN），不参与后续平面/统计；mark 不在其中。
+    removed_mask = r2_reject_mask | spike_mask
+    height[removed_mask] = np.nan
+    fused_peak_map[removed_mask] = np.nan
+    fused_weighted_map[removed_mask] = np.nan
+    confidence_map[removed_mask] = np.nan
+    r2_reject_count = int(np.count_nonzero(r2_reject_mask))
+    spike_reject_count = int(np.count_nonzero(spike_mask))
+
     base_mask = np.isfinite(height) & (~excluded_grid_mask)
     base_valid_count = int(np.count_nonzero(base_mask))
     if base_valid_count < 3:
-        raise ValueError("有效高度点少于 3 个，无法拟合平面。请增大 ROI、增大网格尺寸，或换用亮度峰值算法。")
+        raise ValueError("有效高度点少于 3 个，无法拟合平面。请增大 ROI、增大网格尺寸、放宽滤波(降低R²门限/关闭尖刺)，或换用亮度峰值算法。")
 
     def _fit_plane(current_mask: np.ndarray):
         n = int(np.count_nonzero(current_mask))
@@ -1089,6 +1147,11 @@ def build_height_map_from_zstack(
         "total_count": int(nx * ny),
         "excluded_count": int(np.count_nonzero(excluded_grid_mask)),
         "sigma_outlier_count": int(np.count_nonzero(sigma_outlier_mask)),
+        "r2_reject_count": int(r2_reject_count),
+        "spike_reject_count": int(spike_reject_count),
+        "r2_min": float(r2_min),
+        "spike_sigma": float(spike_sigma),
+        "spike_max_cluster": int(spike_max_cluster),
         "valid_ratio": float(valid_count / float(nx * ny)),
         "z_min_um": float(np.nanmin(height_valid)),
         "z_max_um": float(np.nanmax(height_valid)),
@@ -1125,7 +1188,8 @@ def build_height_map_from_zstack(
     try:
         from scipy.interpolate import griddata
         yy_idx, xx_idx = np.mgrid[0:ny, 0:nx]
-        src = inlier_mask & np.isfinite(height)
+        # 用所有保留的真实测量点(含 mark 特征)做最近邻补全被剔除/排除的空洞；mark 本身是有效值不会被覆盖。
+        src = base_mask & np.isfinite(height)
         if int(np.count_nonzero(src)) >= 4:
             pts = np.column_stack([xx_idx[src].ravel(), yy_idx[src].ravel()])
             vals = height[src].ravel()
@@ -1215,6 +1279,9 @@ class ZStackFocusAnalyzer(tk.Tk):
         self.topo_algorithm_var = tk.StringVar(value="快速最大亮度投影")
         self.topo_grid_px = tk.IntVar(value=32)
         self.topo_sigma_filter_var = tk.DoubleVar(value=3.0)
+        self.topo_min_r2_var = tk.DoubleVar(value=0.5)        # 高斯拟合最低 R²，低于则该点不可信被剔除；0=关闭
+        self.topo_spike_sigma_var = tk.DoubleVar(value=4.0)   # 孤立尖刺剔除 nσ；0=关闭
+        self.topo_spike_max_var = tk.IntVar(value=6)          # 最大尖刺像素数（连通域≤此值才当噪声）
         self.topo_use_roi_var = tk.BooleanVar(value=False)
         self.topo_result: Optional[Dict[str, object]] = None
         self.topo_progress_var = tk.StringVar(value="未生成高度图")
@@ -1458,12 +1525,22 @@ class ZStackFocusAnalyzer(tk.Tk):
         ttk.Entry(line2, textvariable=self.topo_grid_px, width=10).pack(side=tk.LEFT)
         line3 = ttk.Frame(topo_param_frame)
         line3.pack(fill=tk.X, padx=6, pady=4)
-        ttk.Label(line3, text="残差滤波 nσ：").pack(side=tk.LEFT)
-        ttk.Entry(line3, textvariable=self.topo_sigma_filter_var, width=10).pack(side=tk.LEFT)
+        ttk.Label(line3, text="平面残差 nσ：").pack(side=tk.LEFT)
+        ttk.Entry(line3, textvariable=self.topo_sigma_filter_var, width=8).pack(side=tk.LEFT)
         ttk.Label(line3, text="  0=关闭").pack(side=tk.LEFT)
+        # 高度噪声滤波：R² 质量门限 + 孤立尖刺剔除（保留 mark 等连片特征）
+        line4 = ttk.Frame(topo_param_frame)
+        line4.pack(fill=tk.X, padx=6, pady=4)
+        ttk.Label(line4, text="最低 R²：").pack(side=tk.LEFT)
+        ttk.Entry(line4, textvariable=self.topo_min_r2_var, width=6).pack(side=tk.LEFT)
+        ttk.Label(line4, text="  尖刺 nσ：").pack(side=tk.LEFT)
+        ttk.Entry(line4, textvariable=self.topo_spike_sigma_var, width=6).pack(side=tk.LEFT)
+        ttk.Label(line4, text="  最大尖刺px：").pack(side=tk.LEFT)
+        ttk.Entry(line4, textvariable=self.topo_spike_max_var, width=5).pack(side=tk.LEFT)
         ttk.Label(
             topo_param_frame,
-            text="网格 px：填 1=逐像素(最细最慢)，快速预览建议 32 或 64；残差滤波建议 3σ，异常点多用 2.5σ，填 0 关闭。",
+            text="网格 px：1=逐像素(最细最慢)，预览用 32/64。高度噪声滤波：最低R²剔除不可信拟合(0关闭)，"
+                 "尖刺nσ+最大尖刺px 只清除孤立坏点、保留mark等连片特征；平面残差nσ 用于拟合基准平面求Rx/Ry。",
             wraplength=360,
         ).pack(anchor="w", padx=6, pady=(0, 6))
 
@@ -2594,6 +2671,15 @@ class ZStackFocusAnalyzer(tk.Tk):
         except Exception:
             messagebox.showwarning("残差滤波参数无效", "请填写大于等于 0 的 nσ 数值；0 表示关闭滤波。")
             return
+        try:
+            r2_min = float(self.topo_min_r2_var.get())
+            spike_sigma = float(self.topo_spike_sigma_var.get())
+            spike_max = int(self.topo_spike_max_var.get())
+            if r2_min < 0 or r2_min > 1 or spike_sigma < 0 or spike_max < 0:
+                raise ValueError
+        except Exception:
+            messagebox.showwarning("高度滤波参数无效", "最低R² 取 0~1（0关闭）；尖刺nσ ≥0（0关闭）；最大尖刺px ≥0。")
+            return
 
         roi = self.roi if (self.topo_use_roi_var.get() and self.roi is not None) else None
         exclude_rois = list(self.exclude_rois)
@@ -2615,12 +2701,12 @@ class ZStackFocusAnalyzer(tk.Tk):
         image_paths = list(self.image_paths)
         worker = threading.Thread(
             target=self._topography_worker,
-            args=(roi, pix, grid_px, mode, exclude_rois, sigma_filter, z_vals, image_paths),
+            args=(roi, pix, grid_px, mode, exclude_rois, sigma_filter, r2_min, spike_sigma, spike_max, z_vals, image_paths),
             daemon=True,
         )
         worker.start()
 
-    def _topography_worker(self, roi, pix: float, grid_px: int, mode: str, exclude_rois: List[Tuple[int, int, int, int]], sigma_filter: float, z_vals: np.ndarray, image_paths: List[str]):
+    def _topography_worker(self, roi, pix: float, grid_px: int, mode: str, exclude_rois: List[Tuple[int, int, int, int]], sigma_filter: float, r2_min: float, spike_sigma: float, spike_max: int, z_vals: np.ndarray, image_paths: List[str]):
         try:
             def cb(i, total, done_points=0, total_points=0):
                 if total_points and done_points:
@@ -2636,6 +2722,9 @@ class ZStackFocusAnalyzer(tk.Tk):
                 mode=mode,
                 exclude_rois=exclude_rois,
                 sigma_filter=sigma_filter,
+                r2_min=r2_min,
+                spike_sigma=spike_sigma,
+                spike_max_cluster=spike_max,
                 progress_callback=cb,
             )
             self.after(0, lambda: self._finish_topography(result, None))
@@ -2683,7 +2772,11 @@ class ZStackFocusAnalyzer(tk.Tk):
         text.append(f"排除网格点：{stats.get('excluded_count', 0)}")
         if stats.get("exclude_rois"):
             text.append(f"排除区域 Mask：{len(stats.get('exclude_rois', []))} 个")
-        text.append(f"sigma残差滤波：{stats.get('sigma_filter', 0):.3g}σ；剔除异常点 {stats.get('sigma_outlier_count', 0)}；迭代 {stats.get('sigma_iterations', 0)} 次")
+        text.append(
+            f"高度噪声滤波：R²<{stats.get('r2_min', 0):.2g} 剔除 {stats.get('r2_reject_count', 0)} 点；"
+            f"孤立尖刺({stats.get('spike_sigma', 0):.3g}σ,≤{stats.get('spike_max_cluster', 0)}px) 剔除 {stats.get('spike_reject_count', 0)} 点"
+        )
+        text.append(f"平面残差滤波：{stats.get('sigma_filter', 0):.3g}σ；用于基准平面/Rx/Ry，剔除特征/异常 {stats.get('sigma_outlier_count', 0)} 点；迭代 {stats.get('sigma_iterations', 0)} 次")
         if stats.get('sigma_filter', 0) > 0 and np.isfinite(float(stats.get('residual_sigma_um', np.nan))):
             text.append(f"- 最终残差 σ：{stats['residual_sigma_um']:.6f} μm；阈值：±{stats['residual_threshold_um']:.6f} μm")
         text.append("")
