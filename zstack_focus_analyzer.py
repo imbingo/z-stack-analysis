@@ -1141,6 +1141,11 @@ class ZStackFocusAnalyzer(tk.Tk):
         self.is_analyzing = False
         self.plot_mode = "standard"
         self._display_cache: Dict[int, np.ndarray] = {}
+        # 缓存每层原图尺寸 (h, w)，用于显示图与 ROI/识别结果的坐标缩放，
+        # 避免每次刷新都重新 imdecode 整张大图导致拖动卡顿。
+        self._orig_size_cache: Dict[int, Tuple[int, int]] = {}
+        # 层选择滑块防抖句柄。
+        self._scale_after_id: Optional[str] = None
 
         self._setup_style()
         self._build_ui()
@@ -1574,6 +1579,7 @@ class ZStackFocusAnalyzer(tk.Tk):
         if hasattr(self, "mark_label"):
             self.mark_label.config(text="未识别。请先框选包含完整 mark 边界的 ROI。")
         self._display_cache.clear()
+        self._orig_size_cache.clear()
         self.folder_label.config(text=f"{folder}\n共发现 {len(paths)} 张图片")
         if not paths:
             messagebox.showwarning("未找到图片", "文件夹中没有找到 png/jpg/tif/bmp 图片。")
@@ -1904,21 +1910,24 @@ class ZStackFocusAnalyzer(tk.Tk):
                 return
             if i not in self._display_cache:
                 raw = safe_read_gray(self.image_paths[i], normalize_per_image=False)
+                self._orig_size_cache[i] = (int(raw.shape[0]), int(raw.shape[1]))
                 disp = normalize_to_255(raw)
                 disp = resize_max_dim(disp, 1200)
                 self._display_cache[i] = disp
-                # 缓存限制，避免大量大图占内存。
+                # 缓存限制，避免大量大图占内存；原图尺寸缓存同步淘汰。
                 if len(self._display_cache) > 8:
                     for k in list(self._display_cache.keys())[:-8]:
                         self._display_cache.pop(k, None)
+                        self._orig_size_cache.pop(k, None)
             img = self._display_cache[i]
             ax.imshow(img, cmap="gray")
             ax.set_title(title, fontsize=10)
             ax.axis("off")
             # 显示图可能被缩放，ROI 框和圆拟合结果也需要按比例缩放。
-            raw0 = safe_read_gray(self.image_paths[i], normalize_per_image=False)
-            scale_x = img.shape[1] / raw0.shape[1]
-            scale_y = img.shape[0] / raw0.shape[0]
+            # 用缓存的原图尺寸算缩放，避免每次刷新重复 imdecode 整张大图。
+            orig_h, orig_w = self._orig_size_cache.get(i, (img.shape[0], img.shape[1]))
+            scale_x = img.shape[1] / float(orig_w)
+            scale_y = img.shape[0] / float(orig_h)
             if self.roi is not None:
                 x, y, w, h = self.roi
                 rect = plt_rectangle(x * scale_x, y * scale_y, w * scale_x, h * scale_y, edgecolor="#2563EB")
@@ -1966,6 +1975,16 @@ class ZStackFocusAnalyzer(tk.Tk):
         if not self.image_paths:
             return
         self.current_index = int(round(float(value)))
+        # 防抖：拖动滑块时合并连续触发，停顿后再渲染，避免每个像素都重绘三幅图。
+        if self._scale_after_id is not None:
+            try:
+                self.after_cancel(self._scale_after_id)
+            except Exception:
+                pass
+        self._scale_after_id = self.after(60, self._apply_scale_change)
+
+    def _apply_scale_change(self):
+        self._scale_after_id = None
         self.update_image_panel()
 
     def on_tree_select(self, _event):
@@ -2034,9 +2053,9 @@ class ZStackFocusAnalyzer(tk.Tk):
         # 如果当前显示图做过降采样，把框选坐标换算回原始图坐标。
         if self.current_index in self._display_cache:
             disp = self._display_cache[self.current_index]
-            raw = safe_read_gray(self.image_paths[self.current_index], normalize_per_image=False)
-            sx = raw.shape[1] / max(1, disp.shape[1])
-            sy = raw.shape[0] / max(1, disp.shape[0])
+            orig_h, orig_w = self._orig_size_cache.get(self.current_index, (disp.shape[0], disp.shape[1]))
+            sx = orig_w / max(1, disp.shape[1])
+            sy = orig_h / max(1, disp.shape[0])
             x, y, w, h = int(round(x * sx)), int(round(y * sy)), int(round(w * sx)), int(round(h * sy))
         if self.selector_mode == "exclude":
             self.exclude_rois.append((x, y, w, h))
@@ -2145,21 +2164,28 @@ class ZStackFocusAnalyzer(tk.Tk):
         self.mark_progress_var.set(f"逐层中心识别中：0 / {len(self.image_paths)}")
         if hasattr(self, "mark_label"):
             self.mark_label.config(text="正在逐层识别 ROI Mark 中心，完成后会生成三张漂移图。")
-        worker = threading.Thread(target=self._mark_drift_worker, args=(self.roi, self.mark_shape_var.get(), pix), daemon=True)
+        # Tkinter 非线程安全：在主线程读好 Z 值和图片列表，传给 worker，子线程不再访问任何 tk 变量。
+        z_vals = self.z_values()
+        image_paths = list(self.image_paths)
+        worker = threading.Thread(
+            target=self._mark_drift_worker,
+            args=(self.roi, self.mark_shape_var.get(), pix, z_vals, image_paths),
+            daemon=True,
+        )
         worker.start()
 
-    def _mark_drift_worker(self, roi, mode: str, pix: float):
+    def _mark_drift_worker(self, roi, mode: str, pix: float, z_vals: np.ndarray, image_paths: List[str]):
         try:
             rows = []
             errors = []
-            total = len(self.image_paths)
-            for idx, path in enumerate(self.image_paths):
+            total = len(image_paths)
+            for idx, path in enumerate(image_paths):
                 try:
                     raw = safe_read_gray(path, normalize_per_image=False)
                     res = detect_mark_in_roi(raw, roi, mode=mode)
                     res = dict(res)
                     res["layer_index"] = int(idx)
-                    res["z_um"] = float(self.z_value(idx))
+                    res["z_um"] = float(z_vals[idx])
                     res["filename"] = os.path.basename(path)
                     res["pixel_size_um"] = float(pix)
                     res["x_um_abs"] = float(res["x_px"]) * pix
@@ -2462,10 +2488,17 @@ class ZStackFocusAnalyzer(tk.Tk):
             except tk.TclError:
                 pass
 
-        worker = threading.Thread(target=self._topography_worker, args=(roi, pix, grid_px, mode, exclude_rois, sigma_filter), daemon=True)
+        # Tkinter 非线程安全：在主线程读好 Z 值和图片列表，传给 worker，子线程不再访问任何 tk 变量。
+        z_vals = self.z_values()
+        image_paths = list(self.image_paths)
+        worker = threading.Thread(
+            target=self._topography_worker,
+            args=(roi, pix, grid_px, mode, exclude_rois, sigma_filter, z_vals, image_paths),
+            daemon=True,
+        )
         worker.start()
 
-    def _topography_worker(self, roi, pix: float, grid_px: int, mode: str, exclude_rois: List[Tuple[int, int, int, int]], sigma_filter: float):
+    def _topography_worker(self, roi, pix: float, grid_px: int, mode: str, exclude_rois: List[Tuple[int, int, int, int]], sigma_filter: float, z_vals: np.ndarray, image_paths: List[str]):
         try:
             def cb(i, total, done_points=0, total_points=0):
                 if total_points and done_points:
@@ -2473,8 +2506,8 @@ class ZStackFocusAnalyzer(tk.Tk):
                 else:
                     self.after(0, lambda i=i, total=total: self.topo_progress_var.set(f"高度图读取中：{i} / {total} 层"))
             result = build_height_map_from_zstack(
-                self.image_paths,
-                self.z_values(),
+                image_paths,
+                z_vals,
                 roi=roi,
                 pixel_size_um=pix,
                 grid_px=grid_px,
