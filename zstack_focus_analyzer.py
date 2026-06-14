@@ -1504,6 +1504,8 @@ class ZStackFocusAnalyzer(tk.Tk):
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         toolbar = NavigationToolbar2Tk(self.canvas, right)
         toolbar.update()
+        # 鼠标滚轮在光标所在子图上就地放大/缩小，方便检查高度图/融合图细节。
+        self.canvas.mpl_connect("scroll_event", self._on_scroll_zoom)
 
         # 右下方固定结果区：把重要结论从左侧控制栏移出，避免被参数控件挤压。
         bottom_panel = ttk.Frame(right)
@@ -1571,6 +1573,7 @@ class ZStackFocusAnalyzer(tk.Tk):
 
     def _make_topography_axes(self):
         """高度图页面使用：高斯融合灰度图、高度图、残差图、拟合质量图。"""
+        self._detach_selector()
         self.fig.clear()
         self.ax_img = self.fig.add_subplot(2, 2, 1)
         self.ax_curve = self.fig.add_subplot(2, 2, 2)
@@ -1580,12 +1583,41 @@ class ZStackFocusAnalyzer(tk.Tk):
 
     def _make_mark_drift_axes(self):
         """ROI 中心逐层漂移页面：当前图、XY轨迹、ΔX/ΔY-Z、dr-Z。"""
+        self._detach_selector()
         self.fig.clear()
         self.ax_img = self.fig.add_subplot(2, 2, 1)
         self.ax_curve = self.fig.add_subplot(2, 2, 2)
         self.ax_prev = self.fig.add_subplot(2, 2, 3)
         self.ax_next = self.fig.add_subplot(2, 2, 4)
         self.plot_mode = "mark_drift"
+
+    def _detach_selector(self):
+        """切换图表布局前，释放可能仍绑定在旧坐标轴上的 ROI 框选器，避免拦截后续缩放/平移事件。"""
+        if getattr(self, "selector", None) is not None:
+            try:
+                self.selector.set_active(False)
+                self.selector.disconnect_events()
+            except Exception:
+                pass
+            self.selector = None
+
+    def _on_scroll_zoom(self, event):
+        """鼠标滚轮以光标为中心就地缩放当前子图（对图像/曲线/高度图都适用）。"""
+        ax = event.inaxes
+        if ax is None or event.xdata is None or event.ydata is None:
+            return
+        base = 1.2
+        scale = 1.0 / base if event.button == "up" else base
+        x0, x1 = ax.get_xlim()
+        y0, y1 = ax.get_ylim()
+        xd, yd = float(event.xdata), float(event.ydata)
+        new_w = (x1 - x0) * scale
+        new_h = (y1 - y0) * scale
+        relx = (x1 - xd) / (x1 - x0) if (x1 - x0) != 0 else 0.5
+        rely = (y1 - yd) / (y1 - y0) if (y1 - y0) != 0 else 0.5
+        ax.set_xlim(xd - new_w * (1 - relx), xd + new_w * relx)
+        ax.set_ylim(yd - new_h * (1 - rely), yd + new_h * rely)
+        self.canvas.draw_idle()
 
 
     def set_roi_label(self, text: str):
@@ -2674,7 +2706,16 @@ class ZStackFocusAnalyzer(tk.Tk):
 
         # 左上：高斯融合灰度图。若不是亮度高斯算法导致融合图为空，则回退显示当前层原图。
         if np.any(np.isfinite(fused_weighted)):
-            im0 = self.ax_img.imshow(fused_weighted, cmap="gray", origin="upper", aspect="auto")
+            # 背景/弱信号像素没有参与融合（NaN），直接用原始最大亮度投影填回，
+            # 这样融合图是一张完整图像（黑底+亮环），而不是背景显示成空白。
+            edf_disp = fused_weighted.copy()
+            curves = self.topo_result.get("curves")
+            if curves is not None:
+                mip = np.nanmax(np.asarray(curves, dtype=float), axis=0)
+                if mip.shape == edf_disp.shape:
+                    nanmask = ~np.isfinite(edf_disp)
+                    edf_disp[nanmask] = mip[nanmask]
+            im0 = self.ax_img.imshow(edf_disp, cmap="gray", origin="upper", aspect="equal")
             self.ax_img.set_title("高斯加权融合灰度图 / Gaussian EDF", fontsize=10)
             self.ax_img.set_xlabel("X grid")
             self.ax_img.set_ylabel("Y grid")
@@ -2695,7 +2736,7 @@ class ZStackFocusAnalyzer(tk.Tk):
                 ex_rect = plt_rectangle(ex_x * sx, ex_y * sy, ex_w * sx, ex_h * sy, edgecolor="#EF4444", linestyle="--")
                 self.ax_img.add_patch(ex_rect)
 
-        im1 = self.ax_curve.imshow(height, cmap="viridis", origin="upper", aspect="auto")
+        im1 = self.ax_curve.imshow(height, cmap="viridis", origin="upper", aspect="equal")
         sigma_out = np.asarray(self.topo_result.get("sigma_outlier_mask", np.zeros_like(height, dtype=bool)))
         if sigma_out.shape == height.shape and np.any(sigma_out):
             oy, ox = np.where(sigma_out)
@@ -2706,7 +2747,7 @@ class ZStackFocusAnalyzer(tk.Tk):
         self.ax_curve.set_ylabel("Y grid")
         self.fig.colorbar(im1, ax=self.ax_curve, fraction=0.046, pad=0.04)
 
-        im2 = self.ax_prev.imshow(residual, cmap="coolwarm", origin="upper", aspect="auto")
+        im2 = self.ax_prev.imshow(residual, cmap="coolwarm", origin="upper", aspect="equal")
         self.ax_prev.set_title(f"去平面残差 / PV={stats['pv_residual_um']:.4f} μm", fontsize=10)
         self.ax_prev.set_xlabel("X grid")
         self.ax_prev.set_ylabel("Y grid")
@@ -2714,7 +2755,7 @@ class ZStackFocusAnalyzer(tk.Tk):
 
         # 右下：拟合质量/置信度图；比 3D surface 更便于判断哪些区域融合图和高度图可信。
         if np.any(np.isfinite(confidence)):
-            im3 = self.ax_next.imshow(confidence, cmap="magma", origin="upper", aspect="auto", vmin=0, vmax=1)
+            im3 = self.ax_next.imshow(confidence, cmap="magma", origin="upper", aspect="equal", vmin=0, vmax=1)
             self.ax_next.set_title("高斯拟合质量 / 置信度", fontsize=10)
             self.ax_next.set_xlabel("X grid")
             self.ax_next.set_ylabel("Y grid")
@@ -2737,6 +2778,13 @@ class ZStackFocusAnalyzer(tk.Tk):
         if not out:
             return
         img = fused.copy()
+        # 背景/弱信号像素用原始最大亮度投影填回，导出的是一张完整图像（黑底+亮环）。
+        curves = self.topo_result.get("curves")
+        if curves is not None:
+            mip = np.nanmax(np.asarray(curves, dtype=float), axis=0)
+            if mip.shape == img.shape:
+                nanmask = ~np.isfinite(img)
+                img[nanmask] = mip[nanmask]
         finite = np.isfinite(img)
         if not np.any(finite):
             messagebox.showwarning("无有效像素", "高斯融合图没有有效像素。")
