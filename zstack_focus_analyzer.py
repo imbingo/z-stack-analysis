@@ -935,13 +935,15 @@ def build_height_map_from_zstack(
     if "高斯" in mode:
         use_gaussian = True
 
-    # 信号门限：每像素 Z 向曲线幅度需达到全局动态范围的 TOPO_SIGNAL_REL，
-    # 否则视为背景/弱信号，直接跳过（不拟合、不计入面型），既加速又避免背景假高度。
+    # 高度图：对“每个”网格点都做高斯/亚层拟合（背景也算高度），这样平面拟合与 Rx/Ry 能用到
+    #         整幅 FOV，而不是只剩亮 mark。compute_mask 只要求曲线有效（有限）。
+    # 亮度融合(EDF)：才用信号门限 fusion_mask 只保留强信号像素——背景融合无意义且耗时，故跳过。
     global_range = float(np.nanpercentile(curves, 99) - np.nanpercentile(curves, 1))
     signal_gate = max(global_range * TOPO_SIGNAL_REL, 1e-9)
     finite_curve = np.all(np.isfinite(curves), axis=0)
     curve_range = np.nanmax(curves, axis=0) - np.nanmin(curves, axis=0)
-    signal_mask = finite_curve & (curve_range >= signal_gate)
+    compute_mask = finite_curve                                   # 高度：所有有效曲线都拟合
+    fusion_mask = finite_curve & (curve_range >= signal_gate)     # 融合：仅强信号像素
 
     fit_method_map = np.full((ny, nx), "", dtype=object)
     fit_r2_map = np.full((ny, nx), np.nan, dtype=np.float64)
@@ -954,32 +956,33 @@ def build_height_map_from_zstack(
     want_fused = (source == "intensity" and polarity == "peak")
     fast_mode = mode.startswith("快速")
 
-    # 全部模式都走向量化路径：背景/弱信号像素直接被 signal_mask 跳过，逐像素也只需毫秒级。
     if fast_mode and "抛物线" not in mode:
         # 快速最大亮度投影 / 峰值Z：纯 argmax，最快，不做亚层插值。
         idx_map = np.argmax(curves, axis=0)
         peak_vals = np.take_along_axis(curves, idx_map[None, :, :], axis=0)[0].astype(np.float64)
-        height = np.where(signal_mask, z_values[idx_map], np.nan)
-        fused_peak_map = np.where(signal_mask, peak_vals, np.nan)
-        fused_weighted_map = np.where(signal_mask, peak_vals, np.nan)
-        confidence_map = np.where(signal_mask, 0.65, np.nan)
-        fit_method_map[signal_mask] = "fast_argmax"
+        height = np.where(compute_mask, z_values[idx_map], np.nan)
+        confidence_map = np.where(compute_mask, 0.65, np.nan)
+        fit_method_map[compute_mask] = "fast_argmax"
+        if want_fused:
+            fused_peak_map = np.where(fusion_mask, peak_vals, np.nan)
+            fused_weighted_map = np.where(fusion_mask, peak_vals, np.nan)
     else:
         # 快速+抛物线 / 逐点高斯 / 逐点抛物线：全向量化亚层定位（含逐像素 grid=1）。
         out = _fit_height_maps_vectorized(
-            curves, z_values, signal_mask,
+            curves, z_values, compute_mask,
             use_log=use_gaussian, polarity=polarity, want_fused=want_fused,
         )
         height = out["height"]
         fit_r2_map = out["r2"]
         confidence_map = out["confidence"]
-        fused_peak_map = out["fused_peak"]
-        fused_weighted_map = out["fused_weighted"]
+        if want_fused:
+            fused_peak_map = np.where(fusion_mask, out["fused_peak"], np.nan)
+            fused_weighted_map = np.where(fusion_mask, out["fused_weighted"], np.nan)
         if fast_mode:
-            confidence_map = np.where(signal_mask, 0.75, np.nan)
-            fit_method_map[signal_mask] = "fast_parabolic_peak"
+            confidence_map = np.where(compute_mask, 0.75, np.nan)
+            fit_method_map[compute_mask] = "fast_parabolic_peak"
         else:
-            fit_method_map[signal_mask] = "vectorized_log_gaussian" if use_gaussian else "vectorized_parabolic"
+            fit_method_map[compute_mask] = "vectorized_log_gaussian" if use_gaussian else "vectorized_parabolic"
 
     if progress_callback:
         progress_callback(len(image_paths), len(image_paths), total_points, total_points)
@@ -2760,14 +2763,10 @@ class ZStackFocusAnalyzer(tk.Tk):
                 ex_rect = plt_rectangle(ex_x * sx, ex_y * sy, ex_w * sx, ex_h * sy, edgecolor="#EF4444", linestyle="--")
                 self.ax_img.add_patch(ex_rect)
 
-        # 右上：FOV 高度图。背景/被剔除点已用最近邻真实高度补全，不再留白。
+        # 右上：FOV 高度图。每个网格点都已高斯拟合得到高度（含背景）；mark 等特征照常显示。
+        # 仅离群噪声点会在平面拟合时被剔除（不影响这里的显示），剔除数量见结果文字。
         im1 = self.ax_curve.imshow(height_filled, cmap="viridis", origin="upper", aspect="equal")
-        sigma_out = np.asarray(self.topo_result.get("sigma_outlier_mask", np.zeros_like(height, dtype=bool)))
-        if sigma_out.shape == height.shape and np.any(sigma_out):
-            oy, ox = np.where(sigma_out)
-            self.ax_curve.scatter(ox, oy, marker="x", s=18, c="red", label="离群剔除")
-            self.ax_curve.legend(loc="upper right", fontsize=7)
-        self.ax_curve.set_title("FOV 高度图 Z / μm（背景已补全）", fontsize=10)
+        self.ax_curve.set_title("FOV 高度图 Z / μm", fontsize=10)
         self.ax_curve.set_xlabel("X grid")
         self.ax_curve.set_ylabel("Y grid")
         self.fig.colorbar(im1, ax=self.ax_curve, fraction=0.046, pad=0.04)
