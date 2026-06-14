@@ -742,7 +742,10 @@ def _true_gaussian_focus_z(z: np.ndarray, y: np.ndarray, polarity: str = "peak",
 
 def _score_image_for_topography(raw_crop: np.ndarray, mode: str) -> np.ndarray:
     """把单层图像转换为每个 XY 点/网格的 Z 向评分图。"""
-    if mode.startswith("共聚焦亮度"):
+    # 亮度投影 / 快速投影：直接用原始灰度做 Z 向亮度评分。
+    # 共聚焦黑背景下，焦面对应亮度峰值，因此所有“快速投影/亮度”类算法都按亮度处理，
+    # 而不是清晰度高频能量（修正历史上快速模式名义亮度、实际跑清晰度的问题）。
+    if mode.startswith("共聚焦亮度") or mode.startswith("快速") or "亮度" in mode:
         return raw_crop.astype(np.float32)
 
     # 清晰度高度图：用局部高频能量图，而不是整块 variance。再对网格做面积平均。
